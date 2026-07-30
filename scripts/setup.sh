@@ -52,6 +52,21 @@ else
             read -s -p "Confirm passphrase: " PASSPHRASE2
             echo ""
             if [ "$PASSPHRASE" = "$PASSPHRASE2" ] && [ -n "$PASSPHRASE" ]; then
+                # Passphrase strength check
+                PASSLEN=${#PASSPHRASE}
+                if [ "$PASSLEN" -lt 12 ]; then
+                    echo "❌ Too short ($PASSLEN chars). Minimum 12 characters required."
+                    continue
+                fi
+                HAS_UPPER=$(echo "$PASSPHRASE" | grep -c '[A-Z]' || true)
+                HAS_LOWER=$(echo "$PASSPHRASE" | grep -c '[a-z]' || true)
+                HAS_DIGIT=$(echo "$PASSPHRASE" | grep -c '[0-9]' || true)
+                HAS_SPECIAL=$(echo "$PASSPHRASE" | grep -c '[^A-Za-z0-9]' || true)
+                SCORE=$(( (HAS_UPPER>0) + (HAS_LOWER>0) + (HAS_DIGIT>0) + (HAS_SPECIAL>0) ))
+                if [ "$SCORE" -lt 3 ]; then
+                    echo "❌ Weak passphrase. Use at least 3 of: uppercase, lowercase, digits, special characters."
+                    continue
+                fi
                 break
             elif [ -z "$PASSPHRASE" ]; then
                 echo "❌ Passphrase cannot be empty. Try again."
@@ -65,16 +80,17 @@ else
     echo "🔐 Creating CA key (keep this passphrase safe!)..."
 
     # Ed25519 is modern, secure, and fast on Raspberry Pi
-    openssl genpkey \
+    # SECURITY: Passphrase via stdin pipe, NOT pass:arg (prevents ps aux leak)
+    printf '%s\n' "$PASSPHRASE" | openssl genpkey \
         -algorithm ed25519 \
         -aes256 \
-        -pass "pass:$PASSPHRASE" \
+        -pass stdin \
         -out "$GOV_DIR/root-ca.key"
 
     # Extract public key from private key
-    openssl pkey \
+    printf '%s\n' "$PASSPHRASE" | openssl pkey \
         -in "$GOV_DIR/root-ca.key" \
-        -passin "pass:$PASSPHRASE" \
+        -passin stdin \
         -pubout \
         -out "$GOV_DIR/root-ca-pub.pem"
 
@@ -159,8 +175,37 @@ EOF
     echo "✅ Default rules created: $RULES_FILE"
 fi
 
-# 8. Summary
+# 8. Sign config files (rules + revocation list)
+echo ""
+echo "🔐 Signing config files..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -n "$ME_GUARD_PASSPHRASE" ]; then
+    export ME_GUARD_PASSPHRASE
+fi
+python3 "$SCRIPT_DIR/governance.py" sign-config || true
+
+# 9. Sign script integrity manifest
+echo ""
+echo "🔐 Signing script integrity manifest..."
+python3 "$SCRIPT_DIR/governance.py" sign-scripts || true
+
+# 10. Verify setup
+echo ""
+echo "🔍 Verifying setup..."
+if python3 "$SCRIPT_DIR/governance.py" scan "$SCRIPT_DIR/../examples/demo-skill/" 2>&1 | grep -q "trusted"; then
+    echo "✅ Scan test passed."
+else
+    echo "⚠️  Scan test skipped (no demo skill found)."
+fi
+
+# 11. Initialize preload config
+if [ ! -f "$ME_GUARD_DIR/governance/preload_config.json" ]; then
+    echo '{"mode": "FAIL_CLOSED"}' > "$ME_GUARD_DIR/governance/preload_config.json"
+    chmod 600 "$ME_GUARD_DIR/governance/preload_config.json"
+    echo "✅ Preload config created: FAIL_CLOSED (default)"
+fi
+
+# 12. Summary
 echo ""
 echo "✅ Setup complete!"
 echo ""

@@ -48,8 +48,26 @@ SEVERITY_MAP = {
 
 
 def load_config() -> dict:
-    """Load configuration if present."""
+    """Load configuration if present. Verifies signature if CA key exists."""
     if CONFIG_FILE.exists():
+        # Verify signature
+        PUBLIC_KEY = ME_GUARD_DIR / "governance" / "root-ca-pub.pem"
+        sig_path = CONFIG_FILE.with_suffix(".json.sig")
+        if PUBLIC_KEY.exists() and sig_path.exists():
+            import subprocess as sp
+            result = sp.run(
+                ["openssl", "pkeyutl", "-verify", "-pubin",
+                 "-inkey", str(PUBLIC_KEY), "-rawin",
+                 "-in", str(CONFIG_FILE), "-sigfile", str(sig_path)],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                print("🚫 PRELOAD CONFIG SIGNATURE INVALID — possible tampering!")
+                print(f"   File: {CONFIG_FILE}")
+                print("   Run 'governance.py sign-config' to fix.")
+                # FAIL_CLOSED: don't trust tampered config
+                return {"mode": DEFAULT_MODE}
+
         try:
             return json.loads(CONFIG_FILE.read_text())
         except (json.JSONDecodeError, OSError):

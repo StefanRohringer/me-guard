@@ -145,9 +145,19 @@ def get_recent_log_entries(days: int = 7) -> list:
 
 
 def load_revoked() -> list:
-    """Load revocation list."""
+    """Load revocation list. Verifies signature if CA key exists."""
     if not REVOCATION_LIST.exists():
         return []
+    sig_path = REVOCATION_LIST.with_suffix(".json.sig")
+    if PUBLIC_KEY.exists() and sig_path.exists():
+        result = subprocess.run(
+            ["openssl", "pkeyutl", "-verify", "-pubin",
+             "-inkey", str(PUBLIC_KEY), "-rawin",
+             "-in", str(REVOCATION_LIST), "-sigfile", str(sig_path)],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            print("⚠️  WARNING: Revocation list signature INVALID!")
     with open(REVOCATION_LIST) as f:
         return json.load(f).get("revoked_skills", [])
 

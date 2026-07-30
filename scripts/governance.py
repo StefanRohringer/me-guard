@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
 """
-Me-Guard - Main script
+Me-Guard — Local governance system for AI skills.
 
-Local governance system for AI skills.
 Inspired by NVIDIA Verified Agent Skills, but 100% local.
 
+NOTE: This is a BLOCKLIST scanner, not a sandbox.
+It detects known dangerous patterns but CAN be bypassed by
+obfuscation (e.g. exec(base64_decode(...)), string splitting).
+ALWAYS manually review 'review' and 'trusted' classifications.
+
 Subcommands:
-  scan    - Scan skill, output classification (NO Sign)
-  sign    - Sign skill (only after explicit --approve!)
-  verify  - Verify signature
-  list    - List all signed skills
-  revoke  - Revoke signature
-  govern  - All steps (ONLY with --yes-i-know-what-im-doing)
+  scan           - Scan skill, output classification (NO Sign)
+  sign           - Sign skill (only after explicit --approve!)
+  verify         - Verify signature
+  list           - List all signed skills
+  revoke         - Revoke signature
+  govern         - All steps (ONLY with --yes-i-know-what-im-doing)
+  sign-scripts   - (Re-)sign script integrity manifest
+  sign-config    - (Re-)sign rules, revocation list, and config
 
 Important: Scan and Sign are SEPARATE.
 First scan -> manually review -> then sign.
 """
 
 import argparse
-import ast as ast_mod
-import hashlib
 import json
 import os
-import re
-import subprocess
 import sys
 import yaml
-from datetime import datetime, timezone
 from pathlib import Path
+
+# Import extracted modules
+from scanner import scan_skill
+from crypto import (
+    get_passphrase, compute_skill_manifest, sign_skill,
+    verify_skill_openssl, verify_manifest, is_revoked,
+    revoke_skill, create_card, log_event,
+    sign_file, verify_file_signature,
+    compute_script_manifest, verify_script_integrity,
+    verify_passphrase_strength,
+)
 
 # ============================================================
 # Constants
@@ -41,448 +53,87 @@ RULES_DIR = ME_GUARD_DIR / "rules"
 SCAN_LOG = GOV_DIR / "scan.log"
 PRIVATE_KEY = GOV_DIR / "root-ca.key"
 PUBLIC_KEY = GOV_DIR / "root-ca-pub.pem"
-PRIVATE_KEY_PASS = os.environ.get("ME_GUARD_PASSPHRASE")
-
-
-def get_passphrase() -> str:
-    """Get CA passphrase: env var first, fallback to interactive prompt."""
-    global PRIVATE_KEY_PASS
-    if PRIVATE_KEY_PASS:
-        return PRIVATE_KEY_PASS
-    import getpass
-    PRIVATE_KEY_PASS = getpass.getpass("Enter CA passphrase: ")
-    return PRIVATE_KEY_PASS
 REVOCATION_LIST = GOV_DIR / "revoked.json"
+SCRIPTS_MANIFEST = GOV_DIR / "scripts-manifest.json"
+SCRIPTS_DIR = Path(__file__).parent.resolve()
 
 
 # ============================================================
-# Helper functions
+# Self-Integrity Check
 # ============================================================
 
-def log_event(action: str, target: str, result: str, details: str = ""):
-    """Hash-chained logs for audit trail."""
-    GOV_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).isoformat()
+def check_self_integrity(quiet: bool = False) -> bool:
+    """Verify script integrity before any command. Returns True if OK."""
+    if not PRIVATE_KEY.exists():
+        # First-time setup — no key yet, skip check
+        return True
+    if not SCRIPTS_MANIFEST.exists():
+        if not quiet:
+            print("ℹ️  No script manifest yet — run 'governance.py sign-scripts'")
+        return True
 
-    # Get previous hash (for hash chain)
-    prev_hash = "0" * 64
-    if SCAN_LOG.exists() and SCAN_LOG.stat().st_size > 0:
-        with open(SCAN_LOG, "rb") as f:
-            try:
-                f.seek(-512, 2)
-            except OSError:
-                f.seek(0)
-            content = f.read().decode("utf-8", errors="ignore").strip()
-            if content:
-                try:
-                    last_line = content.split("\n")[-1]
-                    prev_entry = json.loads(last_line)
-                    prev_hash = prev_entry.get("hash", prev_hash)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-
-    entry = {
-        "ts": ts,
-        "action": action,
-        "target": target,
-        "result": result,
-        "details": details,
-        "prev_hash": prev_hash,
-    }
-    entry_str = json.dumps(entry, sort_keys=True)
-    entry["hash"] = hashlib.sha256(
-        (entry_str + prev_hash).encode("utf-8")
-    ).hexdigest()
-
-    with open(SCAN_LOG, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    ok, msg = verify_script_integrity(SCRIPTS_DIR, SCRIPTS_MANIFEST, PUBLIC_KEY)
+    if not ok and not quiet:
+        print(f"❌ {msg}")
+        print("   Run 'governance.py sign-scripts' to resign after updates.")
+    return ok
 
 
-def compute_skill_manifest(skill_path: Path) -> dict:
-    """
-    Generates a manifest hash over ALL files in the skill folder.
-    This way not just SKILL.md, but the entire skill can be signed.
-    """
-    if skill_path.is_file():
-        with open(skill_path, "rb") as f:
-            content = f.read()
-        return {
-            "type": "file",
-            "name": skill_path.name,
-            "sha256": hashlib.sha256(content).hexdigest(),
-            "size": len(content),
-        }
-
-    files = []
-    for fp in sorted(skill_path.rglob("*")):
-        if fp.is_file() and not fp.name.startswith("."):
-            with open(fp, "rb") as f:
-                content = f.read()
-            files.append({
-                "path": str(fp.relative_to(skill_path)),
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "size": len(content),
-            })
-
-    combined = "".join(f["sha256"] for f in files)
-    manifest_hash = hashlib.sha256(combined.encode()).hexdigest()
-
-    return {
-        "type": "directory",
-        "name": skill_path.name,
-        "manifest_hash": manifest_hash,
-        "files": files,
-    }
-
+# ============================================================
+# Verified Loaders
+# ============================================================
 
 def load_rules() -> dict:
-    """Load scan rules from YAML."""
+    """Load scan rules from YAML. Verifies signature if key exists."""
     rules_file = RULES_DIR / "default.yaml"
     if not rules_file.exists():
         print(f"⚠️  No rules found: {rules_file}")
         return {"blocked_patterns": [], "review_patterns": [],
                 "ast_forbidden_imports": [], "ast_review_imports": []}
+
+    # Verify rules signature (non-fatal — warn only)
+    if PUBLIC_KEY.exists():
+        sig_ok = verify_file_signature(rules_file, PUBLIC_KEY)
+        if not sig_ok:
+            sig_path = rules_file.with_suffix(rules_file.suffix + ".sig")
+            if sig_path.exists():
+                print(f"🚫 RULES SIGNATURE INVALID: {rules_file}")
+                print("   Possible tampering! Run 'governance.py sign-config' to fix.")
+            else:
+                print(f"⚠️  Rules not signed: {rules_file}")
+                print("   Run 'governance.py sign-config' to sign.")
+
     with open(rules_file) as f:
         return yaml.safe_load(f)
 
 
-# ============================================================
-# Scanner: Regex + AST (for Python)
-# ============================================================
-
-# File type categories for context-aware scanning
-CODE_EXTENSIONS   = {".py", ".sh", ".bash", ".js", ".ts", ".rb", ".pl", ".php", ".go"}
-DOC_EXTENSIONS    = {".md", ".txt", ".rst", ".adoc"}
-CONFIG_EXTENSIONS = {".yaml", ".yml", ".json", ".toml", ".ini"}
-
-
-def file_category(filepath: Path) -> str:
-    """Determines: 'code', 'docs', 'config' or 'other'."""
-    suffix = filepath.suffix.lower()
-    if suffix in CODE_EXTENSIONS:
-        return "code"
-    if suffix in DOC_EXTENSIONS:
-        return "docs"
-    if suffix in CONFIG_EXTENSIONS:
-        return "config"
-    return "other"
-
-
-def scan_file_regex(filepath: Path, rules: dict) -> list:
-    """
-    Regex-based scan with context awareness.
-
-    - 'blocked_patterns'         -> apply everywhere (always hard block)
-    - 'review_patterns_any'      -> apply everywhere (secrets etc.)
-    - 'review_patterns_code'     -> only in code files
-    - 'review_patterns_docs'     -> only in doc files
-    - 'review_patterns_config'   -> only in config files
-    - 'review_patterns'          -> fallback (like code), backwards compatibility
-    """
-    findings = []
-    try:
-        content = filepath.read_text(encoding="utf-8", errors="ignore")
-    except Exception as e:
-        return [{"severity": "review", "file": str(filepath),
-                 "msg": f"File not readable: {e}"}]
-
-    category = file_category(filepath)
-
-    # 1. Blocked patterns: always, everywhere
-    for pattern in rules.get("blocked_patterns", []):
-        for m in re.finditer(pattern, content):
-            findings.append({
-                "severity": "blocked",
-                "file": str(filepath),
-                "pattern": pattern,
-                "match": m.group(0)[:80],
-                "line": content[:m.start()].count("\n") + 1,
-            })
-
-    # 2. Review patterns "any": secrets, tokens — everywhere
-    for pattern in rules.get("review_patterns_any", []):
-        for m in re.finditer(pattern, content):
-            findings.append({
-                "severity": "review",
-                "file": str(filepath),
-                "pattern": pattern,
-                "match": m.group(0)[:80],
-                "line": content[:m.start()].count("\n") + 1,
-                "category": "secret",
-            })
-
-    # 3. Category-specific patterns
-    category_key = f"review_patterns_{category}"
-    for pattern in rules.get(category_key, []):
-        for m in re.finditer(pattern, content):
-            findings.append({
-                "severity": "review",
-                "file": str(filepath),
-                "pattern": pattern,
-                "match": m.group(0)[:80],
-                "line": content[:m.start()].count("\n") + 1,
-                "category": category,
-            })
-
-    # 4. Backwards compatibility: old 'review_patterns'
-    if category == "code":
-        for pattern in rules.get("review_patterns", []):
-            for m in re.finditer(pattern, content):
-                findings.append({
-                    "severity": "review",
-                    "file": str(filepath),
-                    "pattern": pattern,
-                    "match": m.group(0)[:80],
-                    "line": content[:m.start()].count("\n") + 1,
-                    "category": "legacy",
-                })
-
-    return findings
-
-
-def scan_file_ast(filepath: Path, rules: dict) -> list:
-    """AST-based scan for Python files.
-    Also finds obfuscated code like __import__('os').system(...).
-    """
-    if filepath.suffix != ".py":
-        return []
-
-    findings = []
-    forbidden = set(rules.get("ast_forbidden_imports", []))
-    review = set(rules.get("ast_review_imports", []))
-
-    try:
-        tree = ast_mod.parse(
-            filepath.read_text(encoding="utf-8", errors="ignore"))
-    except SyntaxError as e:
-        return [{"severity": "review", "file": str(filepath),
-                 "msg": f"Python syntax error: {e}"}]
-
-    for node in ast_mod.walk(tree):
-        # Imports
-        if isinstance(node, ast_mod.Import):
-            for alias in node.names:
-                if alias.name in forbidden:
-                    findings.append({"severity": "blocked",
-                                     "file": str(filepath),
-                                     "msg": f"Forbidden import: {alias.name}",
-                                     "line": node.lineno})
-                elif alias.name in review:
-                    findings.append({"severity": "review",
-                                     "file": str(filepath),
-                                     "msg": f"Review import: {alias.name}",
-                                     "line": node.lineno})
-
-        if isinstance(node, ast_mod.ImportFrom) and node.module:
-            if node.module in forbidden:
-                findings.append({"severity": "blocked",
-                                 "file": str(filepath),
-                                 "msg": f"Forbidden import: from {node.module}",
-                                 "line": node.lineno})
-            elif node.module in review:
-                findings.append({"severity": "review",
-                                 "file": str(filepath),
-                                 "msg": f"Review import: from {node.module}",
-                                 "line": node.lineno})
-
-        # Dangerous function calls
-        if isinstance(node, ast_mod.Call):
-            func_name = None
-            if isinstance(node.func, ast_mod.Name):
-                func_name = node.func.id
-            elif isinstance(node.func, ast_mod.Attribute):
-                func_name = node.func.attr
-
-            if func_name in ("eval", "exec", "compile", "__import__"):
-                findings.append({"severity": "blocked",
-                                 "file": str(filepath),
-                                 "msg": f"Dangerous call: {func_name}()",
-                                 "line": node.lineno})
-            if func_name == "system":
-                findings.append({"severity": "blocked",
-                                 "file": str(filepath),
-                                 "msg": "os.system() Call",
-                                 "line": node.lineno})
-
-    return findings
-
-
-def scan_skill(skill_path: Path) -> dict:
-    """Main scan function. Classification: trusted/review/blocked."""
-    rules = load_rules()
-    all_findings = []
-
-    if skill_path.is_file():
-        files_to_scan = [skill_path]
-    else:
-        files_to_scan = [
-            fp for fp in skill_path.rglob("*")
-            if fp.is_file() and fp.suffix in (
-                ".py", ".sh", ".md", ".yaml", ".yml", ".txt")
-        ]
-
-    for fp in files_to_scan:
-        all_findings.extend(scan_file_regex(fp, rules))
-        all_findings.extend(scan_file_ast(fp, rules))
-
-    if any(f["severity"] == "blocked" for f in all_findings):
-        classification = "blocked"
-    elif any(f["severity"] == "review" for f in all_findings):
-        classification = "review"
-    else:
-        classification = "trusted"
-
-    return {
-        "skill": str(skill_path),
-        "classification": classification,
-        "findings": all_findings,
-        "scanned_files": len(files_to_scan),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-# ============================================================
-# Skill Card (Metadata)
-# ============================================================
-
-def create_card(skill_path: Path, scan_result: dict) -> Path:
-    """Create skill_card.yaml with metadata."""
-    CATALOG_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = compute_skill_manifest(skill_path)
-
-    card = {
-        "skill_name": skill_path.name,
-        "skill_path": str(skill_path),
-        "created": datetime.now(timezone.utc).isoformat(),
-        "classification": scan_result["classification"],
-        "scanned_files": scan_result["scanned_files"],
-        "findings_count": len(scan_result["findings"]),
-        "manifest": manifest,
-        "governance_version": "1.0",
-    }
-
-    card_file = CATALOG_DIR / f"{skill_path.name}.card.yaml"
-    with open(card_file, "w") as f:
-        yaml.dump(card, f, sort_keys=False, default_flow_style=False)
-    return card_file
-
-
-# ============================================================
-# Signing (Ed25519 via OpenSSL)
-# ============================================================
-
-def sign_skill(skill_path: Path, card_file: Path) -> Path:
-    """Sign the skill card with the private key.
-    Since the card contains the manifest hash, the entire skill is co-signed.
-    """
-    if not PRIVATE_KEY.exists():
-        print(f"❌ Private key missing: {PRIVATE_KEY}")
-        print("   Run setup.sh first!")
-        sys.exit(1)
-
-    SIGS_DIR.mkdir(parents=True, exist_ok=True)
-    sig_file = SIGS_DIR / f"{skill_path.name}.sig"
-
-    # Signature over the card file (contains the manifest hash)
-    result = subprocess.run(
-        ["openssl", "pkeyutl", "-sign",
-         "-inkey", str(PRIVATE_KEY), "-passin", f"pass:{get_passphrase()}",
-         "-rawin", "-in", str(card_file), "-out", str(sig_file)],
-        capture_output=True,
-    )
-
-    if result.returncode != 0:
-        print(f"❌ Signing failed: {result.stderr.decode()}")
-        sys.exit(1)
-
-    return sig_file
-
-
-def verify_skill(skill_path: Path) -> bool:
-    """Verify signature and manifest hash."""
-    card_file = CATALOG_DIR / f"{skill_path.name}.card.yaml"
-    sig_file = SIGS_DIR / f"{skill_path.name}.sig"
-
-    if not card_file.exists():
-        print(f"❌ No card found: {card_file}")
-        return False
-    if not sig_file.exists():
-        print(f"❌ No signature found: {sig_file}")
-        return False
-    if not PUBLIC_KEY.exists():
-        print(f"❌ Public key missing: {PUBLIC_KEY}")
-        return False
+def load_revocation_list() -> dict:
+    """Load revocation list. Verifies signature if key exists."""
+    revoked = {"revoked_skills": []}
+    if not REVOCATION_LIST.exists():
+        return revoked
 
     # Verify signature
-    result = subprocess.run(
-        ["openssl", "pkeyutl", "-verify", "-pubin",
-         "-inkey", str(PUBLIC_KEY), "-rawin",
-         "-in", str(card_file), "-sigfile", str(sig_file)],
-        capture_output=True,
-    )
+    if PUBLIC_KEY.exists():
+        sig_ok = verify_file_signature(REVOCATION_LIST, PUBLIC_KEY)
+        if not sig_ok:
+            sig_path = REVOCATION_LIST.with_suffix(".json.sig")
+            if sig_path.exists():
+                print(f"🚫 REVOCATION LIST SIGNATURE INVALID: {REVOCATION_LIST}")
+                print("   Possible tampering! Run 'governance.py sign-config' to fix.")
+            else:
+                print(f"⚠️  Revocation list not signed — run 'governance.py sign-config'")
 
-    if result.returncode != 0:
-        print(f"❌ Signature invalid!")
-        return False
-
-    # Verify manifest hash
-    with open(card_file) as f:
-        card = yaml.safe_load(f)
-
-    current_manifest = compute_skill_manifest(skill_path)
-    stored_manifest = card["manifest"]
-
-    if current_manifest != stored_manifest:
-        print(f"❌ Skill was modified after signing!")
-        print(f"   Manifest no longer matches.")
-        return False
-
-    # Revocation Check
-    if is_revoked(skill_path.name):
-        print(f"❌ Skill has been revoked!")
-        return False
-
-    return True
-
-
-# ============================================================
-# Revocation
-# ============================================================
-
-def is_revoked(skill_name: str) -> bool:
-    if not REVOCATION_LIST.exists():
-        return False
     with open(REVOCATION_LIST) as f:
-        revoked = json.load(f)
-    return skill_name in revoked.get("revoked_skills", [])
-
-
-def revoke_skill(skill_name: str, reason: str):
-    revoked = {"revoked_skills": []}
-    if REVOCATION_LIST.exists():
-        with open(REVOCATION_LIST) as f:
+        try:
             revoked = json.load(f)
-
-    if skill_name in revoked["revoked_skills"]:
-        print(f"⚠️  {skill_name} is already revoked.")
-        return
-
-    revoked["revoked_skills"].append(skill_name)
-    revoked.setdefault("history", []).append({
-        "skill": skill_name,
-        "reason": reason,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    })
-
-    with open(REVOCATION_LIST, "w") as f:
-        json.dump(revoked, f, indent=2)
-
-    print(f"✅ {skill_name} revoked: {reason}")
-    log_event("revoke", skill_name, "revoked", reason)
+        except json.JSONDecodeError:
+            revoked = {"revoked_skills": []}
+    return revoked
 
 
 # ============================================================
-# CLI
+# CLI Commands
 # ============================================================
 
 def cmd_scan(args):
@@ -491,7 +142,11 @@ def cmd_scan(args):
         print(f"❌ Path not found: {skill_path}")
         sys.exit(1)
 
-    result = scan_skill(skill_path)
+    if not check_self_integrity():
+        sys.exit(1)
+
+    rules = load_rules()
+    result = scan_skill(skill_path, rules)
 
     # JSON mode (for preload script)
     if getattr(args, 'json_output', False):
@@ -512,7 +167,8 @@ def cmd_scan(args):
             print(f"   {sev_icon} {f_item.get('msg', f_item.get('pattern', '?'))}"
                   f" (line {f_item.get('line', '?')})")
 
-    log_event("scan", str(skill_path), result["classification"],
+    log_event(GOV_DIR, SCAN_LOG, "scan", str(skill_path),
+              result["classification"],
               f"{len(result['findings'])} findings, {result['scanned_files']} files")
 
 
@@ -523,12 +179,16 @@ def cmd_sign(args):
         print(f"❌ Path not found: {skill_path}")
         sys.exit(1)
 
+    if not check_self_integrity():
+        sys.exit(1)
+
     # Scan first
-    result = scan_skill(skill_path)
+    rules = load_rules()
+    result = scan_skill(skill_path, rules)
     if result["classification"] == "blocked":
         print(f"🚫 Skill is BLOCKED — cannot sign!")
         print("   Fix issues first, then scan again.")
-        log_event("sign", str(skill_path), "blocked",
+        log_event(GOV_DIR, SCAN_LOG, "sign", str(skill_path), "blocked",
                   f"{len(result['findings'])} critical findings")
         sys.exit(1)
 
@@ -538,11 +198,13 @@ def cmd_sign(args):
         print("   Reason: scan and sign are deliberately separate steps.")
         sys.exit(1)
 
-    card_file = create_card(skill_path, result)
-    sig_file = sign_skill(skill_path, card_file)
+    card_file = create_card(CATALOG_DIR, skill_path, result)
+    passphrase = get_passphrase("ME_GUARD_PASSPHRASE")
+    sig_file = sign_skill(PRIVATE_KEY, PUBLIC_KEY, card_file,
+                          SIGS_DIR, skill_path.name, passphrase)
     print(f"✅ Card created: {card_file}")
     print(f"✅ Signature:    {sig_file}")
-    log_event("sign", str(skill_path), "signed",
+    log_event(GOV_DIR, SCAN_LOG, "sign", str(skill_path), "signed",
               f"classification={result['classification']}, files={result['scanned_files']}")
 
 
@@ -553,15 +215,49 @@ def cmd_verify(args):
         print(f"❌ Path not found: {skill_path}")
         sys.exit(1)
 
-    if verify_skill(skill_path):
-        print(f"✅ {skill_path.name}: Signature VALID, manifest intact.")
-    else:
-        print(f"❌ {skill_path.name}: Verification FAILED.")
+    if not check_self_integrity():
         sys.exit(1)
+
+    card_file = CATALOG_DIR / f"{skill_path.name}.card.yaml"
+    sig_file = SIGS_DIR / f"{skill_path.name}.sig"
+
+    if not card_file.exists():
+        print(f"❌ No card found: {card_file}")
+        sys.exit(1)
+    if not sig_file.exists():
+        print(f"❌ No signature found: {sig_file}")
+        sys.exit(1)
+    if not PUBLIC_KEY.exists():
+        print(f"❌ Public key missing: {PUBLIC_KEY}")
+        sys.exit(1)
+
+    # 1. Verify cryptographic signature (via OpenSSL exit code)
+    sig_ok = verify_skill_openssl(PUBLIC_KEY, card_file, sig_file)
+    if not sig_ok:
+        print(f"❌ {skill_path.name}: Signature INVALID.")
+        sys.exit(1)
+
+    # 2. Verify manifest hash
+    manifest_ok = verify_manifest(skill_path, card_file)
+    if not manifest_ok:
+        print(f"❌ {skill_path.name}: Manifest mismatch — skill was modified!")
+        sys.exit(1)
+
+    # 3. Check revocation (uses verified revocation list)
+    revoked = load_revocation_list()
+    if skill_path.name in revoked.get("revoked_skills", []):
+        print(f"❌ {skill_path.name}: Signature REVOKED.")
+        sys.exit(1)
+
+    print(f"✅ {skill_path.name}: Signature VALID, manifest intact.")
+    log_event(GOV_DIR, SCAN_LOG, "verify", str(skill_path), "valid", "")
 
 
 def cmd_list(args):
     """List all signed skills."""
+    if not check_self_integrity():
+        sys.exit(1)
+
     if not CATALOG_DIR.exists():
         print("ℹ️  No signed skills found.")
         return
@@ -571,6 +267,9 @@ def cmd_list(args):
         print("ℹ️  No signed skills found.")
         return
 
+    revoked = load_revocation_list()
+    revoked_names = set(revoked.get("revoked_skills", []))
+
     print(f"📋 Signed Skills ({len(cards)}):")
     print("=" * 50)
     for card_file in cards:
@@ -578,13 +277,13 @@ def cmd_list(args):
             card = yaml.safe_load(f)
         sig_file = SIGS_DIR / f"{card['skill_name']}.sig"
         sig_ok = sig_file.exists()
-        revoked = is_revoked(card['skill_name'])
-        icon = "✅" if sig_ok and not revoked else "🚫" if revoked else "⚠️"
+        is_revoked_flag = card['skill_name'] in revoked_names
+        icon = "✅" if sig_ok and not is_revoked_flag else "🚫" if is_revoked_flag else "⚠️"
         print(f"  {icon} {card['skill_name']}")
         print(f"     Classification: {card.get('classification', '?')}")
         print(f"     Created:        {card.get('created', '?')[:19]}")
         print(f"     Files:          {card.get('scanned_files', '?')}")
-        if revoked:
+        if is_revoked_flag:
             print(f"     Status:         ❌ REVOKED")
         print()
 
@@ -593,21 +292,38 @@ def cmd_revoke(args):
     """Revoke a skill signature."""
     if not args.reason:
         print("❌ --reason is required for revocation!")
-        print("   Example: --reason \"Vulnerability found in version 1.2\"")
+        print('   Example: --reason "Vulnerability found in version 1.2"')
         sys.exit(1)
-    revoke_skill(args.name, args.reason)
+
+    if not check_self_integrity():
+        sys.exit(1)
+
+    revoke_skill(REVOCATION_LIST, args.name, args.reason)
+
+    # Re-sign revocation list
+    passphrase = get_passphrase("ME_GUARD_PASSPHRASE")
+    try:
+        sign_file(REVOCATION_LIST, PRIVATE_KEY, passphrase)
+        print(f"✅ Revocation list re-signed.")
+    except Exception as e:
+        print(f"⚠️  Could not sign revocation list: {e}")
+        print("   Run 'governance.py sign-config' manually.")
+
+    log_event(GOV_DIR, SCAN_LOG, "revoke", args.name, "revoked", args.reason)
 
 
 def cmd_govern(args):
     """All-in-one: scan + sign + verify (NOT recommended)."""
     if not getattr(args, 'yes_i_know_what_im_doing', False):
         print("❌ This is a DANGEROUS command.")
-        print("   Use --yes-i-know-what-im-doing to proceed.")
-        print("")
+        print("   Use --yes-i-know-what-im-doing to proceed.\n")
         print("   Recommended workflow:")
         print("     governance.py scan <path>")
         print("     governance.py sign <path> --approve")
         print("     governance.py verify <path>")
+        sys.exit(1)
+
+    if not check_self_integrity():
         sys.exit(1)
 
     skill_path = Path(args.path).expanduser().resolve()
@@ -615,22 +331,94 @@ def cmd_govern(args):
         print(f"❌ Path not found: {skill_path}")
         sys.exit(1)
 
-    result = scan_skill(skill_path)
+    rules = load_rules()
+    result = scan_skill(skill_path, rules)
     if result["classification"] == "blocked":
         print(f"🚫 Skill is BLOCKED — aborting!")
         sys.exit(1)
 
-    card_file = create_card(skill_path, result)
-    sig_file = sign_skill(skill_path, card_file)
+    card_file = create_card(CATALOG_DIR, skill_path, result)
+    passphrase = get_passphrase("ME_GUARD_PASSPHRASE")
+    sig_file = sign_skill(PRIVATE_KEY, PUBLIC_KEY, card_file,
+                          SIGS_DIR, skill_path.name, passphrase)
     print(f"✅ Card: {card_file}")
     print(f"✅ Sig:  {sig_file}")
     print()
 
-    if verify_skill(skill_path):
+    card_file_path = CATALOG_DIR / f"{skill_path.name}.card.yaml"
+    sig_file_path = SIGS_DIR / f"{skill_path.name}.sig"
+
+    sig_ok = verify_skill_openssl(PUBLIC_KEY, card_file_path, sig_file_path)
+    manifest_ok = verify_manifest(skill_path, card_file_path)
+    if sig_ok and manifest_ok:
         print(f"✅ {skill_path.name}: All good.")
     else:
         print(f"❌ {skill_path.name}: Something went wrong.")
         sys.exit(1)
+
+
+# ─── Admin: Sign Config Files ───────────────────────────────
+
+def cmd_sign_scripts(args):
+    """Compute and sign script integrity manifest."""
+    if not PRIVATE_KEY.exists():
+        print("❌ No CA key found. Run 'make setup' or 'bash scripts/setup.sh' first.")
+        sys.exit(1)
+
+    manifest = compute_script_manifest(SCRIPTS_DIR)
+    with open(SCRIPTS_MANIFEST, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    passphrase = get_passphrase("ME_GUARD_PASSPHRASE")
+    sig_path = sign_file(SCRIPTS_MANIFEST, PRIVATE_KEY, passphrase)
+
+    print(f"✅ Script manifest signed: {SCRIPTS_MANIFEST}")
+    print(f"   Signature: {sig_path}")
+    print(f"   Files: {manifest['count']} scripts hashed")
+    log_event(GOV_DIR, SCAN_LOG, "sign-scripts", "all", "signed",
+              f"{manifest['count']} scripts, hash={manifest['manifest_hash'][:16]}")
+
+
+def cmd_sign_config(args):
+    """Sign rules, revocation list, and preload config."""
+    if not PRIVATE_KEY.exists():
+        print("❌ No CA key found. Run 'make setup' or 'bash scripts/setup.sh' first.")
+        sys.exit(1)
+
+    passphrase = get_passphrase("ME_GUARD_PASSPHRASE")
+
+    files_to_sign = []
+
+    # 1. Rules
+    rules_file = RULES_DIR / "default.yaml"
+    if rules_file.exists():
+        sig = sign_file(rules_file, PRIVATE_KEY, passphrase)
+        files_to_sign.append(str(rules_file))
+        print(f"✅ Rules signed: {sig}")
+    else:
+        print(f"⚠️  No rules file: {rules_file}")
+
+    # 2. Revocation list
+    if REVOCATION_LIST.exists():
+        sig = sign_file(REVOCATION_LIST, PRIVATE_KEY, passphrase)
+        files_to_sign.append(str(REVOCATION_LIST))
+        print(f"✅ Revocation list signed: {sig}")
+    else:
+        print(f"⚠️  No revocation list: {REVOCATION_LIST}")
+
+    # 3. Preload config
+    config_file = GOV_DIR / "preload_config.json"
+    if config_file.exists():
+        sig = sign_file(config_file, PRIVATE_KEY, passphrase)
+        files_to_sign.append(str(config_file))
+        print(f"✅ Preload config signed: {sig}")
+    # (optional, no warning if missing)
+
+    if files_to_sign:
+        log_event(GOV_DIR, SCAN_LOG, "sign-config", ", ".join(files_to_sign),
+                  "signed", f"{len(files_to_sign)} file(s)")
+    else:
+        print("⚠️  No config files found to sign.")
 
 
 # ============================================================
@@ -680,6 +468,16 @@ def main():
                           dest="yes_i_know_what_im_doing",
                           help="Confirm dangerous all-in-one mode")
     p_govern.set_defaults(func=cmd_govern)
+
+    # sign-scripts (admin)
+    p_sign_scripts = sub.add_parser("sign-scripts",
+                                    help="(Re-)sign script integrity manifest")
+    p_sign_scripts.set_defaults(func=cmd_sign_scripts)
+
+    # sign-config (admin)
+    p_sign_config = sub.add_parser("sign-config",
+                                   help="Sign rules, revocation list, config")
+    p_sign_config.set_defaults(func=cmd_sign_config)
 
     args = parser.parse_args()
     if not args.command:
