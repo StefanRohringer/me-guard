@@ -1,14 +1,14 @@
 # 🛡️ Me-Guard
 
-**Local security and trust system for AI agent skills. 100% offline. Deterministic. For everyone.**
+**Local trust and integrity system for AI agent skills. 100% offline. Deterministic.**
 
 ---
 
 ## What is Me-Guard?
 
-Me-Guard checks and signs AI skills **before** they are executed. Think of it as a digital security gate for your agent skills:
+Me-Guard checks and signs AI skills **before** they are executed. Think of it as a digital integrity gate for your agent skills:
 
-- **Scan** → Searches every skill's code for dangerous patterns (Regex + Python AST)
+- **Scan** → Searches every skill's code for known dangerous patterns (Regex + Python AST)
 - **Sign** → Signs verified skills with a local Ed25519 root CA
 - **Verify** → Checks before every startup whether signatures are still valid
 - **Preload Hook** → Blocks gateway startup on compromised skills
@@ -16,6 +16,42 @@ Me-Guard checks and signs AI skills **before** they are executed. Think of it as
 Inspired by [NVIDIA Verified Agent Skills](https://developer.nvidia.com/blog/nvidia-verified-agent-skills-provide-capability-governance-for-ai-agents/), but completely local on your machine.
 
 > 📌 **Guarantee:** No upload, no external API, no cloud logging. Everything runs under `~/.me-guard/`.
+
+---
+
+## ⚠️ Important Limitations
+
+Please read these before relying on Me-Guard for security-critical environments.
+
+### 1. Scanner = Blocklist, not Sandbox
+The Regex + AST scanner finds **known dangerous patterns** (`rm -rf /`, `__import__('os')`), but it CAN be bypassed by:
+- `exec(base64.b64decode(...))` — encoded payloads
+- String splitting: `__import__("o"+"s")`
+- `getattr(__builtins__, ...)` — dynamic attribute access
+- Shell code in non-Python files (batch, PowerShell, etc.)
+- Code downloaded at runtime from external URLs
+
+**Consequence:** `trusted` classification means "no known dangerous patterns", NOT "safe".
+
+### 2. Signing = Integrity, not Security
+Ed25519 signatures prove the skill has not been modified since you signed it. They do NOT prove the skill is harmless. If you approve and sign a malicious skill (see point 1), the signature validates the malware.
+
+### 3. Single Local Root Key
+The CA key resides on the same machine as the agent. If the host is compromised, an attacker can:
+- Read the encrypted key
+- Capture the passphrase (via keylogger, memory dump, or stdin/proc monitoring)
+- Sign arbitrary skills
+
+This is inherent in any "100% local" design.
+
+### 4. Hash Chain = Tamper-Evident, not Tamper-Proof
+The audit log is stored locally. Anyone with write access to the log file can recalculate the entire hash chain. For OT production, consider shipping logs to an external write-once system.
+
+### 5. TOCTOU (Time-of-check to Time-of-use)
+Skills are scanned and verified at startup, but executed later. A file could be modified between verification and execution. The full-directory manifest hash reduces this risk (any file change invalidates the signature), but runtime monitoring is not provided.
+
+### 6. Passphrase Security
+The CA passphrase can be provided via the `ME_GUARD_PASSPHRASE` environment variable. **Warning:** Environment variables leak via `/proc/<pid>/environ` and are inherited by child processes. For OT/production environments, prefer interactive entry over env vars.
 
 ---
 
@@ -51,7 +87,7 @@ Optional:
 
 ```bash
 # 1. Clone the repository (anywhere you want)
-git clone https://github.com/YOUR_USERNAME/me-guard.git
+git clone https://github.com/StefanRohringer/me-guard.git
 cd me-guard
 
 # 2. One-time setup (creates Ed25519 CA + directory structure)
