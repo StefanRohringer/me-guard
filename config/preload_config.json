@@ -1,0 +1,6 @@
+     1|{
+     2|  "mode": "FAIL_CLOSED",
+     3|  "_comment": "FAIL_CLOSED oder FAIL_SAFE. FAIL_CLOSED = jeder CRITICAL-Skill stoppt Gateway. FAIL_SAFE = CRITICAL-Skills werden in Quarantaene verschoben, Gateway startet trotzdem.",
+     4|  "_env_override": "ME_GUARD_MODE=FAIL_SAFE python3 me-guard-preload.py"
+     5|}
+     6|

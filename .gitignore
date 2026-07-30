@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Secrets & Keys — NEVER commit
+*.key
+*.pem
+*.p12
+*.cert
+*.crt
+*.csr
+*.jks
+*.keystore
+passwords.txt
+secrets*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.sublime-*
+
+# History
+.history/
+.history
+.bash_history
+.zsh_history
+
+# Logs
+*.log
