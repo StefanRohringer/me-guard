@@ -279,7 +279,7 @@ bash scripts/backup-key-to-usb.sh
 ---
 
 ## License
-
+Copyright (C) 2026 Stefan Rohringer
 **GNU General Public License v3.0** — Open source, free to use, but:
 - Modifications must remain under GPL
 - No liability for damages (OT environments at your own risk)
